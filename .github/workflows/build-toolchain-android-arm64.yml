@@ -1,0 +1,432 @@
+name: Build Full Android ARM64 Toolchain (NDK r30)
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: Android minimum API level
+        required: true
+        default: '30'
+        type: choice
+        options: ['29', '30', '31', '32', '33', '34', '35', '36']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-toolchain-android-arm64-r30-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      LLVM_TAG: llvmorg-23.1.6
+      NDK_VERSION: 30.0.16248370
+      NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+      CMAKE_TAG: v4.5.1
+      NINJA_TAG: v1.13.1
+      ANDROID_API: ${{ inputs.android_api }}
+      PREFIX: ${{ github.workspace }}/finalpackage_arm64
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r30
+      NDK_HOST: linux-x86_64
+      BUILD_ROOT: ${{ github.workspace }}/build
+
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          for dir in /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/share/powershell; do
+            if [[ -d "$dir" ]]; then
+              sudo rm -rf "$dir"
+            fi
+          done
+          df -h
+
+      - name: Configure swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 6G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git wget unzip python3 \
+            pkg-config libssl-dev ca-certificates file binutils xz-utils
+
+      - name: Cache Android NDK r30
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: android-ndk-r30
+          key: ${{ runner.os }}-android-ndk-${{ env.NDK_VERSION }}-${{ env.NDK_SHA1 }}
+
+      - name: Download and verify Android NDK r30
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q --show-progress \
+            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+            -O android-ndk-r30-linux.zip
+          echo "${NDK_SHA1}  android-ndk-r30-linux.zip" | sha1sum -c -
+          unzip -q android-ndk-r30-linux.zip
+          rm android-ndk-r30-linux.zip
+          test -x "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/clang"
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          mkdir -p "${BUILD_ROOT}" "${PREFIX}/bin" "${PREFIX}/lib" \
+            "${PREFIX}/include" "${PREFIX}/share" \
+            "${PREFIX}/sysroot/usr/include" "${PREFIX}/sysroot/usr/lib" \
+            "${PREFIX}/sysroot/lib"
+          echo "NDK_HOME=${NDK_HOME}" >> "$GITHUB_ENV"
+          echo "PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          echo "BUILD_ROOT=${BUILD_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "$GITHUB_ENV"
+
+      - name: Clone LLVM 23.1.6
+        run: |
+          git clone --depth 1 --branch "${LLVM_TAG}" \
+            https://github.com/llvm/llvm-project.git llvm-project
+          git -C llvm-project rev-parse HEAD
+
+      - name: Build native TableGen tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S llvm-project/llvm -B "${BUILD_ROOT}/host" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_BUILD_TOOLS=ON
+          cmake --build "${BUILD_ROOT}/host" \
+            --target llvm-tblgen clang-tblgen
+          test -x "${BUILD_ROOT}/host/bin/llvm-tblgen"
+          test -x "${BUILD_ROOT}/host/bin/clang-tblgen"
+
+      - name: Cross-build LLVM, Clang and LLD for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake"
+          NATIVE_TOOLS="${BUILD_ROOT}/host/bin"
+
+          cmake -S llvm-project/llvm -B "${BUILD_ROOT}/android-llvm" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_BINDIR=bin \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_INCLUDEDIR=include \
+            -DCMAKE_INSTALL_DATADIR=share \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DLLVM_ENABLE_PROJECTS='clang;lld' \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_DEFAULT_TARGET_TRIPLE="aarch64-linux-android${ANDROID_API}" \
+            -DLLVM_NATIVE_TOOL_DIR="${NATIVE_TOOLS}" \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DCLANG_BUILD_TOOLS=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DLLVM_ENABLE_PIC=ON \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_LTO=Thin \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_BUILD_EXAMPLES=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_FFI=OFF
+
+          cmake --build "${BUILD_ROOT}/android-llvm"
+          cmake --install "${BUILD_ROOT}/android-llvm"
+
+      - name: Build CMake 4.5.1 for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${CMAKE_TAG}" \
+            https://github.com/Kitware/CMake.git cmake-src
+          git -C cmake-src rev-parse HEAD
+
+          cmake -S cmake-src -B "${BUILD_ROOT}/android-cmake" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_BINDIR=bin \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_DATADIR=share \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_CMAKE_TESTING=OFF \
+            -DCMAKE_USE_OPENSSL=OFF \
+            -DCMAKE_USE_SYSTEM_CURL=OFF \
+            -DCMAKE_USE_SYSTEM_EXPAT=OFF \
+            -DCMAKE_USE_SYSTEM_ZLIB=OFF \
+            -DCMAKE_USE_SYSTEM_LIBARCHIVE=OFF
+
+          cmake --build "${BUILD_ROOT}/android-cmake"
+          cmake --install "${BUILD_ROOT}/android-cmake"
+          test -x "${PREFIX}/bin/cmake"
+          test -d "${PREFIX}/share/cmake-4.5/Modules"
+
+      - name: Build Ninja 1.13.1 for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${NINJA_TAG}" \
+            https://github.com/ninja-build/ninja.git ninja-src
+          git -C ninja-src rev-parse HEAD
+
+          cmake -S ninja-src -B "${BUILD_ROOT}/android-ninja" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+            -DCMAKE_INSTALL_BINDIR=bin \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DBUILD_TESTING=OFF
+
+          cmake --build "${BUILD_ROOT}/android-ninja"
+          cmake --install "${BUILD_ROOT}/android-ninja"
+          test -x "${PREFIX}/bin/ninja"
+
+      - name: Assemble NDK r30 sysroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_SYSROOT="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/sysroot"
+          NDK_TARGET_LIB="${NDK_SYSROOT}/usr/lib/aarch64-linux-android"
+
+          test -d "${NDK_SYSROOT}/usr/include"
+          test -d "${NDK_TARGET_LIB}/${ANDROID_API}"
+
+          # Headers and API-specific Android linker stubs for the selected API.
+          cp -a "${NDK_SYSROOT}/usr/include/." "${PREFIX}/sysroot/usr/include/"
+          cp -a "${NDK_TARGET_LIB}/${ANDROID_API}/." "${PREFIX}/sysroot/usr/lib/"
+          # Preserve the normal NDK triple/API hierarchy as well, so clang driver
+          # can resolve Android libraries when --sysroot points at this package.
+          mkdir -p "${PREFIX}/sysroot/usr/lib/aarch64-linux-android"
+          cp -a "${NDK_TARGET_LIB}/." \
+            "${PREFIX}/sysroot/usr/lib/aarch64-linux-android/"
+
+          # NDK C++ runtime and compatibility libraries live beside the API folders.
+          shopt -s nullglob
+          for f in "${NDK_TARGET_LIB}"/*.so "${NDK_TARGET_LIB}"/*.a; do
+            cp -a "$f" "${PREFIX}/sysroot/lib/"
+          done
+
+          # Keep the same runtime-library indirection as the reference package.
+          if [[ -e "${PREFIX}/sysroot/lib/libc++_shared.so" ]]; then
+            ln -sfn ../sysroot/lib/libc++_shared.so "${PREFIX}/lib/libc++_shared.so"
+          fi
+          if [[ -e "${PREFIX}/sysroot/lib/libbackcompat_shared.so" ]]; then
+            ln -sfn ../sysroot/lib/libbackcompat_shared.so "${PREFIX}/lib/libbackcompat_shared.so"
+          fi
+
+          # Install the NDK's AArch64 Android compiler-rt builtins into Clang's resource dir.
+          BUILTINS="$(find "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/lib/clang" \
+            -type f -name 'libclang_rt.builtins-aarch64-android.a' -print -quit)"
+          test -n "${BUILTINS}"
+          mkdir -p "${PREFIX}/lib/clang/23/lib/linux"
+          install -m 0644 "${BUILTINS}" \
+            "${PREFIX}/lib/clang/23/lib/linux/libclang_rt.builtins-aarch64-android.a"
+
+      - name: Check C++23 mode and NDK r30 libc++ headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_TC="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}"
+          NDK_SYSROOT="${NDK_TC}/sysroot"
+          cat > "${BUILD_ROOT}/cxx23-smoke.cpp" <<'CPP'
+          #include <expected>
+          #include <span>
+          consteval int compile_time_value() { return 23; }
+          static_assert(compile_time_value() == 23);
+          int main() {
+            std::expected<int, int> value = 23;
+            int data[] = {1, 2, 3};
+            std::span<int> view(data);
+            return value.value() + static_cast<int>(view.size());
+          }
+          CPP
+          "${NDK_TC}/bin/clang++" \
+            --target="aarch64-linux-android${ANDROID_API}" \
+            --sysroot="${NDK_SYSROOT}" \
+            -stdlib=libc++ -std=c++23 -fsyntax-only \
+            "${BUILD_ROOT}/cxx23-smoke.cpp"
+
+      - name: Create compatibility names and strip binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLVM_STRIP="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-strip"
+
+          # Versioned Clang driver and the conventional command names from the reference tree.
+          if [[ ! -e "${PREFIX}/bin/clang-23" && -x "${PREFIX}/bin/clang" ]]; then
+            cp -p "${PREFIX}/bin/clang" "${PREFIX}/bin/clang-23"
+          fi
+          test -x "${PREFIX}/bin/clang-23"
+          ln -sfn clang-23 "${PREFIX}/bin/clang"
+          ln -sfn clang "${PREFIX}/bin/clang++"
+
+          for pair in \
+            'llvm-ar ar' \
+            'llvm-ranlib ranlib' \
+            'llvm-strip strip' \
+            'ld.lld ld'; do
+            set -- $pair
+            if [[ -x "${PREFIX}/bin/$1" ]]; then
+              cp -p "${PREFIX}/bin/$1" "${PREFIX}/bin/$2"
+            fi
+          done
+
+          # Reference package exposes this version alias.
+          if [[ -e "${PREFIX}/lib/libLLVM.so" ]]; then
+            ln -sfn libLLVM.so "${PREFIX}/lib/libLLVM-23.so"
+          fi
+
+          # Strip only ELF executables and shared objects; do not run strip on linker-script .a files.
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q '^ELF'; then
+              "$LLVM_STRIP" --strip-unneeded "$f"
+            fi
+          done < <(find "${PREFIX}/bin" "${PREFIX}/lib" -type f \
+            \( -perm -0100 -o -name '*.so' -o -name '*.so.*' \) -print0)
+
+      - name: Prune toolchain to match reference layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. Limpiar bin/ dejando solo los ejecutables/symlinks de la referencia + ld.lld
+          find "${PREFIX}/bin" -maxdepth 1 -type f,l ! \( \
+            -name 'ar' -o -name 'clang' -o -name 'clang++' -o -name 'clang-23' -o \
+            -name 'clang-format' -o -name 'cmake' -o \
+            -name 'ld' -o -name 'ld.lld' -o -name 'lld' -o \
+            -name 'ninja' -o \
+            -name 'ranlib' -o -name 'strip' \
+          \) -delete
+
+          # 2. Limpiar include/ dejándolo vacío (sin cabeceras de Cling/LLVM innecesarias)
+          find "${PREFIX}/include" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+          # 3. Limpiar lib/ dejando solo las .so principales, symlinks y clang/
+          find "${PREFIX}/lib" -mindepth 1 -maxdepth 1 ! \( \
+            -name 'clang' -o \
+            -name 'libLLVM.so' -o -name 'libLLVM-23.so' -o \
+            -name 'libclang-cpp.so' -o \
+            -name 'libLTO.so' -o -name 'libRemarks.so' -o \
+            -name 'libc++_shared.so' -o -name 'libbackcompat_shared.so' \
+          \) -exec rm -rf {} +
+
+          # 4. Limpiar share/ dejando solo cmake-*
+          find "${PREFIX}/share" -mindepth 1 -maxdepth 1 ! -name 'cmake-*' -exec rm -rf {} +
+
+      - name: Validate installation layout and ARM64 ELF files
+        shell: bash
+        run: |
+          set -euo pipefail
+          READELF="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-readelf"
+
+          for d in bin include lib share sysroot; do
+            test -d "${PREFIX}/${d}"
+          done
+
+          for f in \
+            "${PREFIX}/bin/clang-23" \
+            "${PREFIX}/bin/clang-format" \
+            "${PREFIX}/bin/ld.lld" \
+            "${PREFIX}/bin/cmake" \
+            "${PREFIX}/bin/ninja" \
+            "${PREFIX}/lib/libLLVM.so" \
+            "${PREFIX}/lib/libclang-cpp.so" \
+            "${PREFIX}/lib/libLTO.so" \
+            "${PREFIX}/lib/libRemarks.so" \
+            "${PREFIX}/lib/clang/23/include" \
+            "${PREFIX}/sysroot/usr/include" \
+            "${PREFIX}/sysroot/usr/lib"; do
+            test -e "$f" || { echo "Missing required item: $f"; exit 1; }
+          done
+
+          for f in \
+            "${PREFIX}/bin/clang-23" \
+            "${PREFIX}/bin/cmake" \
+            "${PREFIX}/bin/ninja" \
+            "${PREFIX}/lib/libLLVM.so" \
+            "${PREFIX}/lib/libclang-cpp.so"; do
+            "$READELF" -h "$f" | grep -q 'AArch64' || {
+              echo "Unexpected ELF architecture: $f"
+              "$READELF" -h "$f" || true
+              exit 1
+            }
+          done
+
+          echo '--- bin ---'
+          find "${PREFIX}/bin" -maxdepth 1 -printf '%f\n' | sort
+          echo '--- lib ---'
+          find "${PREFIX}/lib" -maxdepth 2 -printf '%y %p -> %l\n' | sort
+          echo '--- root sizes ---'
+          du -sh "${PREFIX}/bin" "${PREFIX}/include" "${PREFIX}/lib" \
+            "${PREFIX}/share" "${PREFIX}/sysroot"
+
+      - name: Package full toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${PREFIX}"
+          XZ_OPT="-9e -T0" tar --sort=name --owner=0 --group=0 --numeric-owner \
+            -cJf "${GITHUB_WORKSPACE}/finalpackage_arm64-r30-llvm23.tar.xz" \
+            bin include lib share sysroot
+          ls -lh "${GITHUB_WORKSPACE}/finalpackage_arm64-r30-llvm23.tar.xz"
+          tar -tJf "${GITHUB_WORKSPACE}/finalpackage_arm64-r30-llvm23.tar.xz" \
+            | cut -d/ -f1 | sort -u
+
+      - name: Upload full toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalpackage-arm64-ndk-r30-llvm-23.1.6
+          path: finalpackage_arm64-r30-llvm23.tar.xz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 31
